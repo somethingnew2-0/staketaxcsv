@@ -122,6 +122,8 @@ def _fetch_txs_legacy(wallet_address, progress):
         current_page += 1
 
         elems, next_id = atom.api_cosmostation.get_txs_legacy(wallet_address, next_id)
+        # print(next_id)
+
         out.extend(elems)
         if next_id is None:
             break

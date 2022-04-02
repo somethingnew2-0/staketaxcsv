@@ -3,7 +3,7 @@ from datetime import datetime
 
 import common.ibc.api_lcd
 from atom.config_atom import localconfig
-from atom.constants import CHAIN_ID_COSMOHUB3, CHAIN_ID_COSMOHUB4, CUR_ATOM, CURRENCIES, MILLION
+from atom.constants import CHAIN_ID_COSMOHUB2, CHAIN_ID_COSMOHUB3, CHAIN_ID_COSMOHUB4, CUR_ATOM, CURRENCIES, MILLION
 from atom.make_tx import make_atom_reward_tx, make_transfer_receive_tx
 from atom.TxInfoAtom import TxInfoAtom
 from common.ErrorCounter import ErrorCounter
@@ -17,6 +17,7 @@ from common.ExporterTypes import (
 from common.make_tx import make_simple_tx, make_transfer_out_tx
 from settings_csv import TICKER_ATOM, ATOM_NODE
 
+import traceback
 
 def process_txs(wallet_address, elems, exporter):
     for elem in elems:
@@ -27,7 +28,11 @@ def process_txs(wallet_address, elems, exporter):
 def process_tx(wallet_address, elem, exporter):
     txid = elem["txhash"]
 
-    chain_id = CHAIN_ID_COSMOHUB3 if "value" in elem["tx"] else CHAIN_ID_COSMOHUB4
+    chain_id = CHAIN_ID_COSMOHUB4
+    if "tags" in elem:
+        chain_id = CHAIN_ID_COSMOHUB2
+    elif "value" in elem["tx"]:
+        chain_id = CHAIN_ID_COSMOHUB3
     timestamp = datetime.strptime(elem["timestamp"], "%Y-%m-%dT%H:%M:%SZ").strftime("%Y-%m-%d %H:%M:%S")
     fee = _get_fee(elem, chain_id)
     url = "https://www.mintscan.io/cosmos/txs/{}".format(txid)
@@ -44,7 +49,9 @@ def process_tx(wallet_address, elem, exporter):
         try:
             _handle_tx(msg_type, exporter, txinfo, elem, txid, i)
         except Exception as e:
-            logging.error("Exception when handling txid=%s, exception:%s", txid, str(e))
+            # logging.error("Exception when handling msg_type=%s, txid=%s, exception:%s, elem:%s", msg_type, txid, str(e), elem)
+            logging.error("Exception when handling msg_type=%s, chain_id=%s, txid=%s, exception:%s", msg_type, txinfo.chain_id, txid, str(e))
+            # traceback.print_exception(e)
             handle_simple_tx(exporter, txinfo, TX_TYPE_UNKNOWN)
 
             if localconfig.debug:
@@ -93,8 +100,12 @@ def handle_del_reward(exporter, txinfo, elem, msg_index, msg_type):
     wallet_address = txinfo.wallet_address
 
     # Use "withdraw_rewards" event if exists
-    events = elem["logs"][msg_index]["events"]
-    reward = _extract_withdraw_rewards(events, txid)
+    events = []
+    if txinfo.chain_id == CHAIN_ID_COSMOHUB2:
+        events = [elem]
+    else:
+        events = elem["logs"][msg_index]["events"]
+    reward = _extract_withdraw_rewards(events, txid, txinfo)
     if reward:
         row = make_atom_reward_tx(txinfo, reward)
         exporter.ingest_row(row)
@@ -141,7 +152,11 @@ def handle_transfer(exporter, txinfo, elem, msg_index):
     wallet_address = txinfo.wallet_address
     txid = txinfo.txid
 
-    events = elem["logs"][msg_index]["events"]
+    events = []
+    if txinfo.chain_id == CHAIN_ID_COSMOHUB2:
+        events = [elem]
+    else:
+        events = elem["logs"][msg_index]["events"]
     transfers_in, transfers_out = _extract_transfers(txinfo, events, wallet_address, txid)
 
     _handle_transfers(exporter, txinfo, transfers_in, transfers_out)
@@ -159,8 +174,11 @@ def _handle_transfers(exporter, txinfo, transfers_in, transfers_out):
 def handle_withdraw_reward(exporter, txinfo, elem, msg_index):
     txid = txinfo.txid
 
-    events = elem["logs"][msg_index]["events"]
-    reward = _extract_withdraw_rewards(events, txid)
+    if txinfo.chain_id == CHAIN_ID_COSMOHUB2:
+        events = [elem]
+    else:
+        events = elem["logs"][msg_index]["events"]
+    reward = _extract_withdraw_rewards(events, txid, txinfo)
 
     if reward:
         row = make_atom_reward_tx(txinfo, reward)
@@ -168,6 +186,8 @@ def handle_withdraw_reward(exporter, txinfo, elem, msg_index):
 
 
 def _extract_transfers(txinfo, events, wallet_address, txid):
+    if txinfo.chain_id == CHAIN_ID_COSMOHUB2:
+        return _extract_transfers_cosmoshub2(events, wallet_address, txid)
     if txinfo.chain_id == CHAIN_ID_COSMOHUB3:
         return _extract_transfers_cosmoshub3(events, wallet_address, txid)
 
@@ -188,6 +208,32 @@ def _extract_transfers(txinfo, events, wallet_address, txid):
                 elif sender == wallet_address:
                     amount, currency = _amount(amount_string)
                     transfers_out.append([amount, currency, sender, recipient])
+
+    return transfers_in, transfers_out
+
+def _extract_transfers_cosmoshub2(events, wallet_address, txid):
+    transfers_in = []
+    transfers_out = []
+
+    elem = events[0]
+    tags = elem["tags"]
+
+    for tag in tags:
+        if tag["key"] == "action":
+            if tag["value"] != "send":
+                return transfers_in, transfers_out
+
+    amount_dict = elem["tx"]["value"]["msg"][0]["value"]["amount"][0]
+    amount, currency = _amount(amount_dict["amount"] + amount_dict["denom"])
+
+    for tag in tags:
+        k1, v1 = tag["key"], tag["value"]
+        if k1 == "sender" and v1 == wallet_address:
+            transfers_out.append([amount, currency, wallet_address, ""])
+        elif k1 == "recipient" and v1 == wallet_address:
+            transfers_in.append([amount, currency, "", wallet_address])
+        elif k1 == "recipient" and v1 != wallet_address:
+            transfers_out.append([amount, currency, wallet_address, ""])
 
     return transfers_in, transfers_out
 
@@ -214,7 +260,9 @@ def _extract_transfers_cosmoshub3(events, wallet_address, txid):
     return transfers_in, transfers_out
 
 
-def _extract_withdraw_rewards(events, txid):
+def _extract_withdraw_rewards(events, txid, txinfo):
+    if txinfo.chain_id == CHAIN_ID_COSMOHUB2:
+        return _extract_withdraw_rewards_cosmoshub2(events, txid)
     for event in events:
         if event["type"] == "withdraw_rewards":
             attributes = event["attributes"]
@@ -226,6 +274,19 @@ def _extract_withdraw_rewards(events, txid):
                     else:
                         # Missing value means reward of zero (as opposed to can't find)
                         return 0
+
+    return None
+
+def _extract_withdraw_rewards_cosmoshub2(events, txid):
+    tags = events[0]["tags"]
+    for tag in tags:
+        if tag["key"] == "rewards":
+            if "value" in tag:
+                amount_string = tag["value"]
+                return _atom(amount_string)
+            else:
+                # Missing value means reward of zero (as opposed to can't find)
+                return 0
 
     return None
 
@@ -261,7 +322,7 @@ def _amount(amount_string):
 
 
 def _get_fee(elem, chain_id):
-    if chain_id == CHAIN_ID_COSMOHUB3:
+    if chain_id != CHAIN_ID_COSMOHUB4:
         return _get_fee_cosmoshub3(elem)
 
     amount_list = elem["tx"]["auth_info"]["fee"]["amount"]
@@ -289,7 +350,7 @@ def _get_fee_cosmoshub3(elem):
 
 def _msg_types(elem, chain_id):
     """Returns list of @type values found in tx.body.messages"""
-    if chain_id == CHAIN_ID_COSMOHUB3:
+    if chain_id != CHAIN_ID_COSMOHUB4:
         return _msg_types_cosmohub3(elem)
 
     types = [msg["@type"] for msg in elem["tx"]["body"]["messages"]]

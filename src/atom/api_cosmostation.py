@@ -3,8 +3,9 @@ import time
 
 import requests
 
-LIMIT = 250
+LIMIT = 50
 INITIAL_ID = 3197873
+
 
 
 def _get_txs_legacy(wallet_address, from_id):
@@ -26,10 +27,14 @@ def get_txs_legacy(wallet_address, from_id=INITIAL_ID):
     data = _get_txs_legacy(wallet_address, from_id)
 
     # Filter to only cosmoshub-3 transactions
-    elems = [datum["data"] for datum in data if datum["header"]["chain_id"] == "cosmoshub-3"]
+    elems = []
+    for datum in data:
+        # print(datum["header"]["chain_id"])
+        if datum["header"]["chain_id"] == "cosmoshub-3" or datum["header"]["chain_id"] == "cosmoshub-2":
+            elems.append(datum["data"])
 
     # Get id argument to be used in subsequent query
-    next_id = data[-1]["header"]["id"] if len(elems) == LIMIT else None
+    next_id = data[-1]["header"]["id"] if len(data) == LIMIT else None
 
     return elems, next_id
 
